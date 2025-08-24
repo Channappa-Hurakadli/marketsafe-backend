@@ -7,6 +7,7 @@ const {
   previewDataset,
   updateDatasetListing,
   downloadDataset,
+  downloadAnonymizedDataset,
 } = require('../controllers/datasetController');
 const { protect, authorize } = require('../middleware/authMiddleware');
 const upload = require('../middleware/fileUpload');
@@ -15,6 +16,7 @@ const upload = require('../middleware/fileUpload');
 router.post('/upload', protect, authorize('seller'), upload, uploadDataset);
 router.get('/my-datasets', protect, authorize('seller'), getMyDatasets);
 router.patch('/:id/list', protect, authorize('seller'), updateDatasetListing);
+router.get('/:id/download-anonymized', protect, authorize('seller'), downloadAnonymizedDataset);
 
 // Buyer routes
 router.get('/marketplace', protect, authorize('buyer'), getMarketplaceDatasets);

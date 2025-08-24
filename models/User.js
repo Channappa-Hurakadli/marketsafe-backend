@@ -19,7 +19,19 @@ const userSchema = new mongoose.Schema({
     type: String,
     enum: ['buyer', 'seller'],
     default: 'buyer'
-  }
+  },
+  subscription: {
+    tier: {
+      type: String,
+      enum: ['none', 'basic', 'pro', 'enterprise'],
+      default: 'none'
+    },
+    uploadCount: {
+      type: Number,
+      default: 0
+    },
+    // You could add subscription start/end dates here in a real app
+  },
 }, {
   timestamps: true,
 });

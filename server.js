@@ -21,6 +21,8 @@ app.use('/api/auth', require('./routes/authRoutes'));
 // app.use('/api/files', require('./routes/fileRoutes'));
 app.use('/api/datasets', require('./routes/datasetRoutes'));
 app.use('/api/purchases', require('./routes/purchaseRoutes'));
+app.use('/api/subscriptions', require('./routes/subscriptionRoutes'));
+app.use('/api/seller', require('./routes/sellerRoutes'));
 
 // Error Middleware
 app.use(notFound);

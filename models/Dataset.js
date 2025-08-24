@@ -56,6 +56,14 @@ const datasetSchema = new mongoose.Schema({
     type: Number,
     required: true,
   },
+  status: {
+    type: String,
+    enum: ['processing', 'anonymized', 'failed'],
+    default: 'processing'
+  },
+  anonymizedFilePath: {
+    type: String, // Path to the processed, downloadable file
+  },
 }, {
   timestamps: true,
 });
