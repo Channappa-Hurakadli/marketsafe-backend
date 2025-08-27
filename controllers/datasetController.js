@@ -4,6 +4,7 @@ const User = require('../models/User');
 const path = require('path');
 const fs = require('fs');
 const csv = require('csv-parser');
+const { spawn } = require('child_process'); // Import spawn to run Python script
 
 const TIER_LIMITS = {
   basic: 5,
@@ -11,16 +12,11 @@ const TIER_LIMITS = {
   enterprise: Infinity
 };
 
-/**
- * @desc    Upload a new dataset, check subscription, and start anonymization
- * @route   POST /api/datasets/upload
- * @access  Private (Sellers only)
- */
 const uploadDataset = async (req, res) => {
   try {
     const seller = await User.findById(req.user.id);
 
-    // Requirement 5: Check subscription and upload limits
+    // Subscription and validation checks
     if (seller.subscription.tier === 'none') {
       return res.status(403).json({ message: 'You must have an active subscription to upload datasets.' });
     }
@@ -28,7 +24,6 @@ const uploadDataset = async (req, res) => {
     if (seller.subscription.uploadCount >= limit) {
       return res.status(403).json({ message: `You have reached your upload limit of ${limit} for the ${seller.subscription.tier} plan.` });
     }
-
     if (!req.file) {
       return res.status(400).json({ message: 'Please upload a file.' });
     }
@@ -37,58 +32,57 @@ const uploadDataset = async (req, res) => {
       return res.status(400).json({ message: 'Please provide title, description, and price.' });
     }
 
-    // Count rows to determine dataPoints
-    let dataPoints = 0;
-    fs.createReadStream(path.resolve(req.file.path))
-      .pipe(csv())
-      .on('data', () => dataPoints++)
-      .on('end', async () => {
-        try {
-          const newDataset = new Dataset({
-            seller: req.user.id,
-            title,
-            description,
-            price,
-            category,
-            isListed: isListed === 'true', // Convert string from FormData to boolean
-            dataPoints,
-            views: 0,
-            status: 'processing', // Requirement 1: Start as processing
-            anonymizedFilePath: null,
-            originalFileName: req.file.originalname,
-            filePath: req.file.path,
-            fileType: req.file.mimetype,
-            fileSize: req.file.size,
-          });
-          await newDataset.save();
+    // Save initial dataset record with 'processing' status
+    const newDataset = new Dataset({
+      seller: req.user.id,
+      title, description, price, category,
+      isListed: isListed === 'true',
+      status: 'processing',
+      originalFileName: req.file.originalname,
+      filePath: req.file.path,
+      fileType: req.file.mimetype,
+      fileSize: req.file.size,
+    });
+    await newDataset.save();
 
-          // Increment seller's upload count
-          seller.subscription.uploadCount += 1;
-          await seller.save();
+    seller.subscription.uploadCount += 1;
+    await seller.save();
 
-          // Simulate the anonymization process
-          setTimeout(() => {
+    // --- Anonymization Integration ---
+    const inputPath = path.resolve(newDataset.filePath);
+    const outputPath = path.resolve(req.file.destination, `anonymized-${newDataset._id}.csv`);
+
+    // Requirement 1: Execute the Python script with the uploaded file as input
+    const pythonProcess = spawn('python', ['anonymize.py', inputPath, outputPath]);
+
+    pythonProcess.stdout.on('data', (data) => console.log(`Python Script: ${data}`));
+    pythonProcess.stderr.on('data', (data) => console.error(`Python Script Error: ${data}`));
+
+    pythonProcess.on('close', async (code) => {
+      if (code === 0) {
+        let dataPoints = 0;
+        fs.createReadStream(outputPath).pipe(csv()).on('data', () => dataPoints++)
+          .on('end', async () => {
             newDataset.status = 'anonymized';
-            newDataset.anonymizedFilePath = newDataset.filePath; // In a real app, this would be a new file path
-            newDataset.save();
-            console.log(`Dataset ${newDataset._id} has been "anonymized".`);
-          }, 10000); // 10-second delay
+            newDataset.anonymizedFilePath = outputPath;
+            newDataset.dataPoints = dataPoints;
+            await newDataset.save();
+            console.log(`Dataset ${newDataset._id} successfully anonymized.`);
+          });
+      } else {
+        newDataset.status = 'failed';
+        await newDataset.save();
+        console.error(`Anonymization failed for dataset ${newDataset._id}.`);
+      }
+    });
+    
+    res.status(201).json(newDataset);
 
-          res.status(201).json(newDataset);
-        } catch (dbError) {
-          res.status(500).json({ message: 'Failed to save dataset to database.' });
-        }
-      });
   } catch (error) {
-    res.status(500).json({ message: 'Server error during upload.' });
+    res.status(500).json({ message: 'Server error during upload initiation.' });
   }
 };
 
-/**
- * @desc    Get all datasets uploaded by the logged-in seller
- * @route   GET /api/datasets/my-datasets
- * @access  Private (Sellers only)
- */
 const getMyDatasets = async (req, res) => {
   try {
     const datasets = await Dataset.find({ seller: req.user.id }).sort({ createdAt: -1 });
@@ -98,17 +92,14 @@ const getMyDatasets = async (req, res) => {
   }
 };
 
-/**
- * @desc    Get all listed datasets for the marketplace, excluding purchased ones
- * @route   GET /api/datasets/marketplace
- * @access  Private (Buyers only)
- */
+// Requirement 2: The anonymized dataset is what gets listed
 const getMarketplaceDatasets = async (req, res) => {
   try {
     const userPurchases = await Purchase.find({ buyer: req.user.id }).select('dataset');
     const purchasedDatasetIds = userPurchases.map(p => p.dataset);
     const datasets = await Dataset.find({
       isListed: true,
+      status: 'anonymized', // Only show fully processed datasets
       _id: { $nin: purchasedDatasetIds }
     }).populate('seller', 'name');
     res.json(datasets);
@@ -117,33 +108,25 @@ const getMarketplaceDatasets = async (req, res) => {
   }
 };
 
-/**
- * @desc    Get a preview of a dataset (first 5 rows) and increment views
- * @route   GET /api/datasets/:id/preview
- * @access  Private (Buyers only)
- */
+// Requirement 3: Preview the ANONYMIZED data
 const previewDataset = async (req, res) => {
-  try {
-    const dataset = await Dataset.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } }, { new: true });
-    if (!dataset) {
-      return res.status(404).json({ message: 'Dataset not found' });
+    try {
+        await Dataset.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
+        const dataset = await Dataset.findById(req.params.id);
+        if (!dataset || dataset.status !== 'anonymized' || !dataset.anonymizedFilePath) {
+            return res.status(404).json({ message: 'Anonymized dataset not found or still processing.' });
+        }
+        const results = [];
+        fs.createReadStream(path.resolve(dataset.anonymizedFilePath))
+            .pipe(csv())
+            .on('data', (data) => { if (results.length < 5) results.push(data); })
+            .on('end', () => res.json({ headers: results.length > 0 ? Object.keys(results[0]) : [], rows: results }))
+            .on('error', () => res.status(500).json({ message: 'Error reading file for preview.' }));
+    } catch (error) {
+        res.status(500).json({ message: 'Server error' });
     }
-    const results = [];
-    fs.createReadStream(path.resolve(dataset.filePath))
-      .pipe(csv())
-      .on('data', (data) => { if (results.length < 5) results.push(data); })
-      .on('end', () => res.json({ headers: results.length > 0 ? Object.keys(results[0]) : [], rows: results }))
-      .on('error', () => res.status(500).json({ message: 'Error reading file for preview.' }));
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
-  }
 };
 
-/**
- * @desc    Update a dataset's listing status after a simulated payment
- * @route   PATCH /api/datasets/:id/list
- * @access  Private (Sellers only)
- */
 const updateDatasetListing = async (req, res) => {
   try {
     const dataset = await Dataset.findById(req.params.id);
@@ -152,10 +135,6 @@ const updateDatasetListing = async (req, res) => {
     if (dataset.status !== 'anonymized') {
       return res.status(400).json({ message: 'Dataset is still processing and cannot be listed.' });
     }
-    
-    // Requirement 4: Simulate payment for listing
-    // In a real app, you would verify payment here.
-    
     dataset.isListed = req.body.isListed;
     const updatedDataset = await dataset.save();
     res.json(updatedDataset);
@@ -164,32 +143,23 @@ const updateDatasetListing = async (req, res) => {
   }
 };
 
-/**
- * @desc    Download a purchased dataset file
- * @route   GET /api/datasets/:id/download
- * @access  Private (Buyers who have purchased)
- */
+// Requirement 3: Download the ANONYMIZED data for buyers
 const downloadDataset = async (req, res) => {
   try {
     const purchaseRecord = await Purchase.findOne({ buyer: req.user.id, dataset: req.params.id });
-    if (!purchaseRecord) {
-      return res.status(403).json({ message: 'Access denied. You have not purchased this dataset.' });
-    }
+    if (!purchaseRecord) return res.status(403).json({ message: 'You have not purchased this dataset.' });
+    
     const dataset = await Dataset.findById(req.params.id);
-    if (!dataset || !dataset.filePath) {
-      return res.status(404).json({ message: 'Dataset or file path not found.' });
+    if (!dataset || !dataset.anonymizedFilePath) {
+      return res.status(404).json({ message: 'Anonymized dataset file not found.' });
     }
-    res.download(path.resolve(dataset.filePath), dataset.originalFileName);
+    res.download(path.resolve(dataset.anonymizedFilePath), `purchased_${dataset.originalFileName}`);
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
   }
 };
 
-/**
- * @desc    Download the seller's own anonymized dataset
- * @route   GET /api/datasets/:id/download-anonymized
- * @access  Private (Sellers only)
- */
+// Requirement 3: Download the seller's own ANONYMIZED dataset
 const downloadAnonymizedDataset = async (req, res) => {
     try {
         const dataset = await Dataset.findById(req.params.id);
